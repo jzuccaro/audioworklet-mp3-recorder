@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+	<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+	<link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.3.1/css/bootstrap.min.css" integrity="sha384-ggOyR0iXCbMQv3Xipma34MD+dH/1fQ784/j6cY/iJTQUOhcWr7x9JvoRxT2MZw1T" crossorigin="anonymous">
+	<script scr="lame.min.js"></script>
+</head>
+
+<body>
+	<div class="container mt-3">
+
+		<div class=" d-flex p-2 align-items-center justify-content-center ">
+			<button class="btn btn-danger mr-2 btn-small" onClick="start();" id="recordButton" disabled style="display:block;">Record</button>
+			<button class="btn btn-primary btn-small" onClick="stop();" id="stopButton" disabled style="display:block;">Stop</button>
+			<div class="align-self-start pt-2"><canvas class="m-2 border border-primary rounded" id="display" width="128" height="20" ></canvas></div>
+			<div id="timer" class="align-self-center small">00:00</div>
+		</div>
+		<div class=" d-flex p-2 align-items-center justify-content-center ">
+			<div id="player"></div>
+		</div>
+	</div>
+
+
+	<script>
+		//GUI Elements to Update
+		const display = document.getElementById("display");
+		const canvasCtx = display.getContext("2d");
+		const timer = document.getElementById("timer");
+		const recordButton = document.getElementById("recordButton");
+		const stopButton = document.getElementById("stopButton");
+
+		//The Audio Context
+		const context = new window.AudioContext();
+
+		let microphone = "";
+		let recording = false;
+		let recorderNode = "";
+		let seconds = 0;
+		let timerInterval = "";
+
+		//Once the module is added we enable the record button...
+		context.audioWorklet.addModule('processor.js').then(() => {
+			recordButton.disabled = false;
+		}).catch(err => {
+			//Something went wrong... handle it.
+			alert(err);
+		});
+
+
+
+		//The Service Worker
+		let realTimeWorker = new Worker('worker.js');
+
+		//Let's initialize the worker. This creates a new instance of the Mp3Encoder over there; this would be a great point to send configuration information to the Service Worker
+		realTimeWorker.postMessage({
+			cmd: 'init'
+		});
+
+
+		//Functions...
+
+		//Updates the timer label
+		const updateTimer = () => {
+			let minutes = Math.floor(seconds / 60);
+			let displaySeconds = Math.floor(seconds - minutes * 60);
+			document.getElementById("timer").innerText = (minutes <= 9 ? '0' + minutes : minutes) + ":" + (displaySeconds <= 9 ? '0' + displaySeconds : displaySeconds);
+		};
+
+
+		//Updates the Canvas as we record. The canvas serves no purpose other than showing some GUI activity
+		const drawCanvas = array => {
+			canvasCtx.clearRect(0, 0, display.width, display.height);
+			canvasCtx.fillStyle = "#28a745";
+			canvasCtx.strokeStyle = "#28a745";
+			canvasCtx.lineWidth = 1;
+			canvasCtx.beginPath();
+			array.forEach((point, index) => {
+				if (index === 0) {
+					canvasCtx.moveTo(index, point / 10);
+				} else {
+					canvasCtx.lineTo(index, point / 10);
+				}
+				canvasCtx.stroke();
+			});
+		};
+
+		//Starts recording...
+		const start = () => {
+			//Only if we are not recording though..
+			if (!recording) {
+				//We need to check the state of the context and resume it if suspended
+				if (context.state === 'suspended') {
+					context.resume().then(startRecording());
+					return;
+				} else {
+					startRecording();
+				}
+			}
+		}
+
+		//Really starts recording once the context is resumed if needed...
+		const startRecording = () => {
+			//We start capturing audio
+			navigator.getUserMedia({
+				audio: {
+					mandatory: {
+						echoCancellation: false
+					}
+				}
+			}, stream => {
+
+				//Success, we are now recording, update the GUI
+				recording = true;
+				recordButton.disabled = true;
+				stopButton.disabled = false;
+				seconds = 0;
+
+				//Increment the seconds each second
+				timerInterval = setInterval(() => {
+					seconds++;
+					updateTimer();
+				}, 1000);
+
+				//The microphone
+				microphone = context.createMediaStreamSource(stream);
+
+				//The Analyser for paiting the canvas
+				const analyser = context.createAnalyser();
+				analyser.fftSize = 128;
+				const dataArray = new Uint8Array(analyser.fftSize);
+				microphone.connect(analyser);
+
+				//The AudioWorklet
+				recorderNode = new window.AudioWorkletNode(
+					context,
+					'processor');
+
+				microphone.connect(recorderNode);
+				recorderNode.connect(context.destination);
+
+				//This is how we receive the arrayBuffer from the AudioWorkletProcessor, we used it to draw the canvas and we pass it to the worker for encoding
+				recorderNode.port.onmessage = e => {
+
+					//This is for drawing the canvas
+					analyser.getByteTimeDomainData(dataArray);
+					drawCanvas(dataArray);
+
+					//Pass the arrayBuffer to the Service Worker
+					realTimeWorker.postMessage({
+						cmd: 'encode',
+						buf: e.data
+					});
+				};
+
+
+			}, error => {
+				alert("Something went wrong... probably no mic available or the user denied permission");
+
+			});
+
+		};
+
+		//Stops the recording process
+		const stop = () => {
+
+			//Only if we are actually recording though..
+			if (recording) {
+				microphone.disconnect();
+
+				//Stop the timer
+				clearInterval(timerInterval);
+
+				recorderNode.disconnect();
+				recording = false;
+				recordButton.disabled = false;
+				stopButton.disabled = true;
+
+				//We send the finish command to the Service Worker, This will cause the Service Worker to post a response message with the buffer...
+				realTimeWorker.postMessage({
+					cmd: 'finish'
+				});
+
+			}
+		};
+
+		//Once we send the finish command the Service Worker will post the buffer back, so let's process that message
+		realTimeWorker.onmessage = e => {
+			switch (e.data.cmd) {
+				case 'end':
+
+					//Create a new Blob
+					let mp3Blob = new Blob(e.data.buf, {
+						type: 'audio/mp3'
+					});
+
+					//Add a player for the Blob, we could upload the Blob to a server from here
+					let url = window.URL.createObjectURL(mp3Blob);
+					let audio = document.createElement('audio');
+					audio.controls = true;
+					audio.src = url;
+					document.getElementById("player").innerHTML = "";
+					document.getElementById("player").append(audio);
+
+					//Clear the rest of the GUI
+					canvasCtx.clearRect(0, 0, display.width, display.height);
+					timer.innerHTML = "00:00";
+					break;
+
+
+			}
+		};
+	</script>
+
+</body>
+
+</html>
